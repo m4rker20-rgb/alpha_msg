@@ -1,0 +1,1680 @@
+__id__ = "alpha_msg"
+__name__ = "Alpha Msg"
+__description__ = "Настраивает прозрачность заливки пузырей сообщений и рисует цветную рамку."
+__author__ = "@Coder_Minecraft"
+__icon__ = "SHCHperma9740/12"
+__version__ = "ОЧКО"
+__sdk_version__ = ">=1.4.3.3"
+__min_version__ = "11.12.0"
+
+from android_utils import run_on_ui_thread, OnClickListener
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from java import dynamic_proxy, jclass, jint
+from java.lang import Integer
+from ui.settings import Divider, Header, Text
+
+SETTING_ALPHA_FILL = "alpha_fill"
+DEFAULT_ALPHA_FILL = 100
+SETTING_ALPHA_FRAME = "alpha_frame"
+DEFAULT_ALPHA_FRAME = 0
+SETTING_FRAME_COLOR = "frame_color"
+DEFAULT_FRAME_COLOR = -13664019  # #FF2F80ED
+FRAME_COLORS = (
+    -1,          # white
+    -5196872,    # light gray
+    -9670796,    # gray
+    -13750221,   # dark gray
+    -16777216,   # black
+    -42401,      # red
+    -30147,      # orange
+    -14020,      # amber
+    -8464041,    # light green
+    -13710223,   # green
+    -15024996,   # teal
+    -11767809,   # blue
+    -13664019,   # telegram blue
+    -6598176,    # purple
+    -41816,      # pink
+)
+MIN_ALPHA_FILL = 0
+MAX_ALPHA_FILL = 100
+MESSAGE_DRAWABLE_CLASS = "org.telegram.ui.ActionBar.MessageDrawable"
+MESSAGE_DRAWABLE_CLASSES = (
+    MESSAGE_DRAWABLE_CLASS,
+    "org.telegram.ui.ActionBar.Theme$MessageDrawable",
+)
+CHAT_ACTIVITY_CLASS = "org.telegram.ui.ChatActivity"
+
+
+def _clamp_percent(value, default=DEFAULT_ALPHA_FILL):
+    try:
+        percent = int(round(float(value)))
+    except Exception:
+        return default
+    if percent < MIN_ALPHA_FILL:
+        return MIN_ALPHA_FILL
+    if percent > MAX_ALPHA_FILL:
+        return MAX_ALPHA_FILL
+    return percent
+
+
+def _normalize_frame_color(value, default=DEFAULT_FRAME_COLOR):
+    try:
+        color = int(value)
+    except Exception:
+        return default
+    if color > 0x7FFFFFFF:
+        if color > 0xFFFFFFFF:
+            return default
+        color -= 0x100000000
+    elif color < -0x80000000:
+        return default
+    return color
+
+
+def _contrast_color(color):
+    value = int(color) & 0xFFFFFFFF
+    red = (value >> 16) & 0xFF
+    green = (value >> 8) & 0xFF
+    blue = value & 0xFF
+    if (299 * red + 587 * green + 114 * blue) / 1000.0 > 160:
+        return -16777216
+    return -1
+
+
+def _error_text(error):
+    try:
+        name = type(error).__name__
+        text = str(error)
+        if text:
+            return name + ": " + text
+        return name
+    except Exception:
+        return "unknown error"
+
+
+def _resolve_class(name):
+    try:
+        cls = find_class(name)
+    except Exception:
+        cls = None
+    if cls is not None:
+        return cls
+    try:
+        return jclass(name)
+    except Exception:
+        return None
+
+
+def _resolve_message_drawable_info():
+    for name in MESSAGE_DRAWABLE_CLASSES:
+        try:
+            cls = find_class(name)
+        except Exception:
+            cls = None
+        if cls is not None:
+            return cls, name, "find_class"
+        try:
+            cls = jclass(name)
+        except Exception:
+            cls = None
+        if cls is not None:
+            return cls, name, "jclass"
+    return None, "", ""
+
+
+def _resolve_message_drawable():
+    cls, _name, _via = _resolve_message_drawable_info()
+    return cls
+
+
+def _is_int_type(types):
+    try:
+        if not types:
+            return False
+        try:
+            if str(types[0].getName()) == "int":
+                return True
+        except Exception:
+            pass
+        return types[0] == Integer.TYPE
+    except Exception:
+        return False
+
+
+def _class_name_of(cls):
+    try:
+        return str(cls.getName())
+    except Exception:
+        return ""
+
+
+def _class_for_name(name):
+    if not name:
+        return None
+    try:
+        return jclass("java.lang.Class").forName(name)
+    except Exception:
+        return None
+
+
+def _has_methods(methods):
+    if methods is None:
+        return False
+    try:
+        return len(methods) > 0
+    except Exception:
+        return False
+
+
+def _methods_for_class(cls, class_name):
+    try:
+        methods = cls.getDeclaredMethods()
+    except Exception:
+        methods = None
+    if _has_methods(methods):
+        return cls, methods
+    reflected = _class_for_name(class_name)
+    if reflected is not None:
+        try:
+            methods = reflected.getDeclaredMethods()
+        except Exception:
+            methods = None
+        if _has_methods(methods):
+            return reflected, methods
+    return None, None
+
+
+def _find_method(methods, method_name, param_count):
+    first_match = None
+    try:
+        for method in methods:
+            try:
+                if str(method.getName()) != method_name:
+                    continue
+                try:
+                    count = int(method.getParameterCount())
+                except Exception:
+                    try:
+                        count = len(method.getParameterTypes())
+                    except Exception:
+                        continue
+                if count != param_count:
+                    continue
+                if first_match is None:
+                    first_match = method
+                if method_name == "setAlpha" and param_count == 1:
+                    return first_match, method
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return first_match, None
+
+
+def _resolve_method(cls, class_name, method_name, param_count):
+    if cls is None:
+        return None
+    original = cls
+    first_match = None
+    saw_methods = False
+    seen = set()
+    scan_cls = cls
+    scan_name = class_name
+    while scan_cls is not None:
+        name = _class_name_of(scan_cls) or scan_name
+        if name and name in seen:
+            break
+        if name:
+            seen.add(name)
+        methods_cls, methods = _methods_for_class(scan_cls, name)
+        if methods is not None:
+            saw_methods = True
+            first, preferred = _find_method(methods, method_name, param_count)
+            if first_match is None and first is not None:
+                first_match = first
+            if preferred is not None:
+                return preferred
+        next_cls = methods_cls if methods_cls is not None else scan_cls
+        try:
+            scan_cls = next_cls.getSuperclass()
+        except Exception:
+            scan_cls = None
+        scan_name = ""
+    if first_match is not None:
+        return first_match
+    if not saw_methods:
+        try:
+            class_object = original.getClass()
+            methods = class_object.getDeclaredMethods()
+            if _has_methods(methods):
+                first, preferred = _find_method(methods, method_name, param_count)
+                if preferred is not None:
+                    return preferred
+                if first is not None:
+                    return first
+        except Exception:
+            pass
+    if method_name == "setAlpha":
+        fallback_cls = original
+        seen_fallback = set()
+        while fallback_cls is not None:
+            name = _class_name_of(fallback_cls)
+            if name and name in seen_fallback:
+                break
+            if name:
+                seen_fallback.add(name)
+            try:
+                return fallback_cls.getDeclaredMethod("setAlpha", Integer.TYPE)
+            except Exception:
+                try:
+                    fallback_cls = fallback_cls.getSuperclass()
+                except Exception:
+                    return None
+    return None
+
+
+def _walk_classes(obj):
+    try:
+        cls = obj.getClass()
+    except Exception:
+        return
+    while cls is not None:
+        yield cls
+        try:
+            cls = cls.getSuperclass()
+        except Exception:
+            return
+
+
+def _call_private(obj, name, types, args):
+    for cls in _walk_classes(obj):
+        try:
+            method = cls.getDeclaredMethod(name, *types)
+            method.setAccessible(True)
+            return True, method.invoke(obj, *args)
+        except Exception:
+            pass
+    return False, None
+
+
+class SettingsStore:
+    def __init__(self, plugin):
+        self._plugin = plugin
+        self.percent = DEFAULT_ALPHA_FILL
+        self.frame_percent = DEFAULT_ALPHA_FRAME
+        self.frame_color = DEFAULT_FRAME_COLOR
+
+    def load(self):
+        try:
+            raw = self._plugin.get_setting(SETTING_ALPHA_FILL, DEFAULT_ALPHA_FILL)
+        except Exception:
+            raw = DEFAULT_ALPHA_FILL
+        self.percent = _clamp_percent(raw)
+        try:
+            raw_frame = self._plugin.get_setting(
+                SETTING_ALPHA_FRAME, DEFAULT_ALPHA_FRAME
+            )
+        except Exception:
+            raw_frame = DEFAULT_ALPHA_FRAME
+        self.frame_percent = _clamp_percent(raw_frame, DEFAULT_ALPHA_FRAME)
+        try:
+            raw_color = self._plugin.get_setting(
+                SETTING_FRAME_COLOR, DEFAULT_FRAME_COLOR
+            )
+        except Exception:
+            raw_color = DEFAULT_FRAME_COLOR
+        self.frame_color = _normalize_frame_color(raw_color)
+        self._plugin._apply_percent(self.percent)
+        self._plugin._apply_frame_color(self.frame_color)
+        return self.percent
+
+    def save_fill(self, percent):
+        value = _clamp_percent(percent)
+        self.set_live_fill(value)
+        try:
+            self._plugin.set_setting(SETTING_ALPHA_FILL, value)
+        except Exception as error:
+            self._plugin._log_safe("save failed: " + _error_text(error))
+
+    def set_live_fill(self, percent):
+        value = _clamp_percent(percent)
+        self.percent = value
+        self._plugin._apply_percent(value)
+
+    def save_frame(self, percent):
+        value = _clamp_percent(percent, DEFAULT_ALPHA_FRAME)
+        self.set_live_frame(value)
+        try:
+            self._plugin.set_setting(SETTING_ALPHA_FRAME, value)
+        except Exception as error:
+            self._plugin._log_safe("save failed: " + _error_text(error))
+
+    def set_live_frame(self, percent):
+        value = _clamp_percent(percent, DEFAULT_ALPHA_FRAME)
+        self.frame_percent = value
+        self._plugin._apply_frame(value)
+
+    def save_color(self, color):
+        value = _normalize_frame_color(color)
+        self.set_live_color(value)
+        try:
+            self._plugin.set_setting(SETTING_FRAME_COLOR, value)
+        except Exception as error:
+            self._plugin._log_safe("save failed: " + _error_text(error))
+
+    def set_live_color(self, color):
+        value = _normalize_frame_color(color)
+        self.frame_color = value
+        self._plugin._apply_frame_color(value)
+
+    def save(self, percent):
+        self.save_fill(percent)
+
+    def set_live(self, percent):
+        self.set_live_fill(percent)
+
+    def is_default(self):
+        return (
+            self.percent == DEFAULT_ALPHA_FILL
+            and self.frame_percent == DEFAULT_ALPHA_FRAME
+            and self.frame_color == DEFAULT_FRAME_COLOR
+        )
+
+    def reset(self):
+        self.percent = DEFAULT_ALPHA_FILL
+        self.frame_percent = DEFAULT_ALPHA_FRAME
+        self.frame_color = DEFAULT_FRAME_COLOR
+        self._plugin._apply_percent(DEFAULT_ALPHA_FILL)
+        self._plugin._apply_frame(DEFAULT_ALPHA_FRAME)
+        self._plugin._apply_frame_color(DEFAULT_FRAME_COLOR)
+
+
+class CompatProbe:
+    def check(self):
+        drawable = _resolve_message_drawable()
+        if drawable is None:
+            return (
+                False,
+                "no MessageDrawable",
+                "no MessageDrawable: " + MESSAGE_DRAWABLE_CLASS + " not resolved",
+            )
+        return True, "", ""
+
+
+class InstallFailure(Exception):
+    def __init__(self, status, reason):
+        super().__init__(reason)
+        self.status = status
+        self.reason = reason
+
+
+class RepaintHelper:
+    def __init__(self):
+        self._chat_class = None
+        self._pending = False
+
+    def clear(self):
+        self._chat_class = None
+        self._pending = False
+
+    def _get_chat_class(self):
+        if self._chat_class is None:
+            self._chat_class = _resolve_class(CHAT_ACTIVITY_CLASS)
+        return self._chat_class
+
+    def invalidate_visible_messages(self):
+        # несколько вызовов подряд (перетаскивание слайдера) схлопываем в один
+        if self._pending:
+            return
+        self._pending = True
+        try:
+            run_on_ui_thread(self._run_pending)
+        except Exception:
+            self._run_pending()
+
+    def _run_pending(self):
+        self._pending = False
+        self._invalidate_on_ui()
+
+    def _invalidate_on_ui(self):
+        try:
+            from client_utils import get_last_fragment
+            fragment = get_last_fragment()
+            if fragment is None:
+                return
+            chat_class = self._get_chat_class()
+            if chat_class is None or not isinstance(fragment, chat_class):
+                return
+            _call_private(fragment, "updateVisibleRows", [], [])
+            view = fragment.getFragmentView()
+            if view is not None:
+                view.invalidate()
+        except Exception:
+            pass
+
+
+class BubbleAlphaHook(MethodHook):
+    def __init__(self, percent=DEFAULT_ALPHA_FILL):
+        super().__init__()
+        self.percent = percent
+
+    def before_hooked_method(self, param):
+        try:
+            percent = self.percent
+            if percent >= MAX_ALPHA_FILL:
+                return
+            alpha = param.args[0]
+            if alpha is None:
+                return
+            value = int(alpha)
+            param.args[0] = jint(int(value * percent / 100))
+        except Exception:
+            pass
+
+
+class FrameDrawHook(MethodHook):
+    """Рисует рамку после draw(). Горячий путь сведён к ~3 JNI-вызовам."""
+
+    _CACHE_LIMIT = 128
+
+    def __init__(
+        self,
+        percent=DEFAULT_ALPHA_FILL,
+        frame_percent=DEFAULT_ALPHA_FRAME,
+        frame_color=DEFAULT_FRAME_COLOR,
+        apply_fill=True,
+        require_hardware=False,
+    ):
+        super().__init__()
+        self.percent = percent
+        self.frame_percent = frame_percent
+        self.frame_color = frame_color
+        self.apply_fill = apply_fill
+        self.require_hardware = require_hardware
+        self._ready = False
+        self._paint = None
+        self._rect = None
+        self._paint_key = None
+        self._stroke = 0.0
+        self._dp18 = 0.0
+        # id(obj) -> [obj_ref, last_bounds_key, cached_path, cached_radius]
+        # obj_ref удерживает объект, чтобы id не переиспользовался после GC.
+        # MessageDrawable шарятся между сообщениями, записей будет всего несколько.
+        self._geom_cache = {}
+
+    def _setup(self):
+        Paint = jclass("android.graphics.Paint")
+        Style = jclass("android.graphics.Paint$Style")
+        RectF = jclass("android.graphics.RectF")
+        AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+        paint = Paint()
+        paint.setAntiAlias(True)
+        try:
+            paint.setStyle(Style.STROKE)
+        except Exception:
+            paint.setStyle(Style.valueOf("STROKE"))
+        self._stroke = float(AndroidUtilities.dp(2))
+        paint.setStrokeWidth(self._stroke)
+        self._dp18 = float(AndroidUtilities.dp(18))
+        self._paint = paint
+        self._rect = RectF()
+        self._ready = True
+
+    def after_hooked_method(self, param):
+        if self.frame_percent <= 0:
+            return
+        try:
+            self._draw_frame(param)
+        except Exception:
+            pass
+
+    def _get_geom_entry(self, obj, bounds):
+        cache = self._geom_cache
+        obj_id = id(obj)
+        entry = cache.get(obj_id)
+        if entry is not None and entry[0] is not obj:
+            entry = None
+        if entry is None:
+            if len(cache) > self._CACHE_LIMIT:
+                cache.clear()
+            entry = [obj, None, None, -1.0]
+            cache[obj_id] = entry
+        bounds_key = (bounds.left, bounds.top, bounds.right, bounds.bottom)
+        if entry[1] == bounds_key and entry[2] is not None:
+            return entry, bounds_key, True
+        return entry, bounds_key, False
+
+    def _fetch_radius(self, obj):
+        radius = self._dp18
+        try:
+            radii = obj.getRadii()
+            if radii is not None:
+                best = 0.0
+                for item in radii:
+                    try:
+                        value = float(item)
+                    except Exception:
+                        continue
+                    if value > best:
+                        best = value
+                if best > 0:
+                    radius = best
+        except Exception:
+            pass
+        return radius
+
+    def _draw_frame(self, param):
+        args = param.args
+        if args is None or len(args) < 1:
+            return
+        canvas = args[0]
+        obj = param.thisObject
+        if canvas is None or obj is None:
+            return
+        if self.require_hardware:
+            try:
+                if not canvas.isHardwareAccelerated():
+                    return
+            except Exception:
+                pass
+        if not self._ready:
+            self._setup()
+        paint = self._paint
+        color = self.frame_color
+        if color is None:
+            color = DEFAULT_FRAME_COLOR
+        # цвет/альфа меняются только когда изменились настройки
+        percent = self.frame_percent
+        key = (color, percent)
+        if key != self._paint_key:
+            paint.setColor(jint(color))
+            paint.setAlpha(int(255 * percent / 100))
+            self._paint_key = key
+
+        bounds = obj.getBounds()
+        if bounds is None:
+            return
+
+        entry, bounds_key, fresh = self._get_geom_entry(obj, bounds)
+        path = entry[2]
+        if not fresh:
+            # геометрия изменилась (новый размер/пузырь) — пересчитываем один раз
+            path = None
+            try:
+                p = obj.makePath()
+                if p is not None and not p.isEmpty():
+                    path = p
+            except Exception:
+                path = None
+            if entry[3] < 0:
+                entry[3] = self._fetch_radius(obj)
+            entry[1] = bounds_key
+            entry[2] = path
+
+        if path is not None:
+            canvas.drawPath(path, paint)
+            return
+
+        # запасной путь: скруглённый прямоугольник по границам
+        left = float(bounds.left)
+        top = float(bounds.top)
+        right = float(bounds.right)
+        bottom = float(bounds.bottom)
+        if right - left <= 2 or bottom - top <= 2:
+            return
+        inset = self._stroke / 2.0
+        l = left + inset
+        t = top + inset
+        r = right - inset
+        b = bottom - inset
+        if r - l <= 1 or b - t <= 1:
+            return
+        radius = entry[3]
+        if radius < 0:
+            radius = self._dp18
+        radius = min(radius, (r - l) / 2.0, (b - t) / 2.0)
+        self._rect.set(l, t, r, b)
+        canvas.drawRoundRect(self._rect, radius, radius, paint)
+
+
+class BubbleDrawHook(FrameDrawHook):
+    """Запасной вариант: меняет alpha заливки в draw() и рисует рамку."""
+
+    def before_hooked_method(self, param):
+        if not self.apply_fill:
+            return
+        try:
+            percent = self.percent
+            if percent >= MAX_ALPHA_FILL:
+                return
+            paint = param.thisObject.getPaint()
+            if paint is None:
+                return
+            paint.setAlpha(int(255 * percent / 100))
+        except Exception:
+            pass
+
+
+class SliderFactory:
+    def __init__(self, plugin, store, title="Alpha Fill", kind="fill"):
+        self._plugin = plugin
+        self._store = store
+        self._title = title
+        self._kind = kind
+
+    def _get(self):
+        if self._kind == "frame":
+            return self._store.frame_percent
+        return self._store.percent
+
+    def _set_live(self, value):
+        if self._kind == "frame":
+            self._store.set_live_frame(value)
+        else:
+            self._store.set_live_fill(value)
+
+    def _save(self, value):
+        if self._kind == "frame":
+            self._store.save_frame(value)
+        else:
+            self._store.save_fill(value)
+
+    def _theme_color(self, resources_provider, key):
+        Theme = jclass("org.telegram.ui.ActionBar.Theme")
+        try:
+            if resources_provider is not None:
+                return Theme.getColor(key, resources_provider)
+        except Exception:
+            pass
+        return Theme.getColor(key)
+
+    def _text_view(self, context, text, size_dp, color):
+        TextView = jclass("android.widget.TextView")
+        TypedValue = jclass("android.util.TypedValue")
+        view = TextView(context)
+        view.setText(str(text))
+        view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, int(size_dp))
+        view.setTextColor(color)
+        return view
+
+    def build(self):
+        from ui.settings import Custom, SimpleSettingFactory
+
+        plugin = self._plugin
+        title_text = self._title
+        get_value = self._get
+        set_live = self._set_live
+        save = self._save
+        default_value = (
+            DEFAULT_ALPHA_FRAME if self._kind == "frame" else DEFAULT_ALPHA_FILL
+        )
+        theme_color = self._theme_color
+        text_view = self._text_view
+
+        def create_view(context, list_view, current_account, class_guid, resources_provider):
+            Gravity = jclass("android.view.Gravity")
+            LinearLayout = jclass("android.widget.LinearLayout")
+            AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+            LayoutHelper = jclass("org.telegram.ui.Components.LayoutHelper")
+            SeekBarView = jclass("org.telegram.ui.Components.SeekBarView")
+            Theme = jclass("org.telegram.ui.ActionBar.Theme")
+
+            initial = get_value()
+            accent = theme_color(resources_provider, Theme.key_windowBackgroundWhiteBlueText)
+            title_color = theme_color(resources_provider, Theme.key_windowBackgroundWhiteBlackText)
+            track_color = theme_color(resources_provider, Theme.key_switchTrack)
+
+            root = LinearLayout(context)
+            root.setOrientation(LinearLayout.VERTICAL)
+            root.setPadding(
+                AndroidUtilities.dp(21),
+                AndroidUtilities.dp(10),
+                AndroidUtilities.dp(21),
+                AndroidUtilities.dp(12),
+            )
+
+            row = LinearLayout(context)
+            row.setOrientation(LinearLayout.HORIZONTAL)
+            row.setGravity(Gravity.CENTER_VERTICAL)
+
+            title = text_view(context, title_text, 16, title_color)
+            row.addView(
+                title,
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0),
+            )
+
+            value = text_view(context, str(initial) + "%", 14, accent)
+            row.addView(value, LayoutHelper.createLinear(-2, -2))
+            root.addView(row, LayoutHelper.createLinear(-1, -2))
+
+            seek = SeekBarView(context, resources_provider)
+            seek.setReportChanges(True)
+            try:
+                seek.setColors(track_color, accent)
+            except Exception:
+                pass
+            seek.setProgress(initial / 100.0)
+            root.addView(seek, LayoutHelper.createLinear(-1, 38, 0, 2, 0, 0, 0))
+
+            delegate_class = jclass(
+                "org.telegram.ui.Components.SeekBarView$SeekBarViewDelegate"
+            )
+
+            class _SliderDelegate(dynamic_proxy(delegate_class)):
+                def onSeekBarDrag(self, stop, progress):
+                    try:
+                        progress = max(0.0, min(1.0, float(progress)))
+                        percent = _clamp_percent(
+                            progress * 100.0, default_value
+                        )
+                        if percent != get_value():
+                            set_live(percent)
+                            value.setText(str(percent) + "%")
+                            plugin.repaint.invalidate_visible_messages()
+                        if stop:
+                            save(percent)
+                    except Exception:
+                        pass
+
+                def onSeekBarPressed(self, pressed):
+                    return None
+
+                def getContentDescription(self):
+                    return title_text + ": " + str(get_value()) + "%"
+
+                def getStepsCount(self):
+                    return MAX_ALPHA_FILL - MIN_ALPHA_FILL
+
+                def needVisuallyDivideSteps(self):
+                    return False
+
+            delegate = _SliderDelegate()
+            plugin._settings_refs.append(delegate)
+            seek.setDelegate(delegate)
+            return root
+
+        def bind_view(view, item, divider, adapter, list_view):
+            try:
+                percent = get_value()
+                view.getChildAt(0).getChildAt(1).setText(str(percent) + "%")
+                view.getChildAt(1).setProgress(percent / 100.0)
+            except Exception:
+                pass
+
+        factory = SimpleSettingFactory(
+            create_view,
+            bind_view,
+            is_clickable=False,
+            is_shadow=False,
+        )
+        plugin._settings_refs.append(factory)
+        return Custom(factory=factory.instance.java)
+
+
+class FrameColorFactory:
+    def __init__(self, plugin, store):
+        self._plugin = plugin
+        self._store = store
+
+    def build(self):
+        from ui.settings import Custom, SimpleSettingFactory
+
+        plugin = self._plugin
+        store = self._store
+        state = {}
+
+        def create_view(
+            context,
+            list_view,
+            current_account,
+            class_guid,
+            resources_provider,
+        ):
+            View = jclass("android.view.View")
+            FrameLayout = jclass("android.widget.FrameLayout")
+            LinearLayout = jclass("android.widget.LinearLayout")
+            TextView = jclass("android.widget.TextView")
+            GradientDrawable = jclass("android.graphics.drawable.GradientDrawable")
+            Gravity = jclass("android.view.Gravity")
+            Typeface = jclass("android.graphics.Typeface")
+            TypedValue = jclass("android.util.TypedValue")
+            AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+            LayoutHelper = jclass("org.telegram.ui.Components.LayoutHelper")
+            Theme = jclass("org.telegram.ui.ActionBar.Theme")
+
+            def dp(value):
+                return AndroidUtilities.dp(value)
+
+            def theme_color(key, fallback):
+                try:
+                    if resources_provider is not None:
+                        return Theme.getColor(key, resources_provider)
+                except Exception:
+                    pass
+                try:
+                    return Theme.getColor(key)
+                except Exception:
+                    return fallback
+
+            title_color = theme_color(
+                "windowBackgroundWhiteBlackText", -1
+            )
+            subtitle_color = theme_color(
+                "windowBackgroundWhiteGrayText2", 0xFF7D7D7D
+            )
+            bubble_fill = theme_color(
+                "chat_inBubble", _normalize_frame_color(0xFF303030)
+            )
+            bubble_text = theme_color("chat_messageTextIn", -1)
+            border_color = 0x66808080
+            selection_color = title_color
+
+            def style_swatch(drawable, color, selected=False, radius_dp=11):
+                drawable.setShape(GradientDrawable.RECTANGLE)
+                drawable.setCornerRadius(float(dp(radius_dp)))
+                drawable.setColor(jint(color))
+                if selected:
+                    drawable.setStroke(dp(2), jint(selection_color))
+                else:
+                    drawable.setStroke(dp(1), jint(border_color))
+
+            root = LinearLayout(context)
+            root.setOrientation(LinearLayout.HORIZONTAL)
+            root.setGravity(Gravity.CENTER_VERTICAL)
+            root.setPadding(dp(21), dp(10), dp(21), dp(10))
+            root.setMinimumHeight(dp(50))
+
+            title = TextView(context)
+            title.setText("Frame color")
+            title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+            title.setTextColor(jint(title_color))
+            title.setSingleLine(True)
+            root.addView(title, LinearLayout.LayoutParams(0, -2, 1.0))
+
+            row_swatch = View(context)
+            row_swatch_drawable = GradientDrawable()
+            style_swatch(
+                row_swatch_drawable,
+                store.frame_color,
+                radius_dp=8,
+            )
+            row_swatch.setBackground(row_swatch_drawable)
+            row_swatch_params = LinearLayout.LayoutParams(dp(26), dp(26))
+            row_swatch_params.setMargins(dp(12), 0, 0, 0)
+            root.addView(row_swatch, row_swatch_params)
+
+            def update_row(value):
+                value = _normalize_frame_color(value)
+                try:
+                    style_swatch(
+                        row_swatch_drawable,
+                        value,
+                        radius_dp=8,
+                    )
+                    row_swatch.invalidate()
+                except Exception:
+                    pass
+
+            def open_dialog(_view=None):
+                old = state.get("dialog")
+                if old is not None:
+                    try:
+                        if old.isShowing():
+                            return
+                    except Exception:
+                        pass
+
+                sheet_root = LinearLayout(context)
+                sheet_root.setOrientation(LinearLayout.VERTICAL)
+                sheet_root.setGravity(Gravity.CENTER_HORIZONTAL)
+                sheet_root.setPadding(dp(16), dp(10), dp(16), dp(22))
+
+                # ---- handle (как на макете) ----
+                handle = View(context)
+                handle_drawable = GradientDrawable()
+                handle_drawable.setShape(GradientDrawable.RECTANGLE)
+                handle_drawable.setCornerRadius(float(dp(2)))
+                handle_drawable.setColor(jint(0x66808080))
+                handle.setBackground(handle_drawable)
+                sheet_root.addView(
+                    handle,
+                    LayoutHelper.createLinear(
+                        36, 4, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 18
+                    ),
+                )
+
+                # ---- превью-пузырь: текст + время/галочка ----
+                preview = LinearLayout(context)
+                preview.setOrientation(LinearLayout.HORIZONTAL)
+                preview.setGravity(Gravity.CENTER_VERTICAL)
+                preview.setPadding(dp(16), dp(9), dp(14), dp(9))
+                preview_drawable = GradientDrawable()
+                preview_drawable.setShape(GradientDrawable.RECTANGLE)
+                preview_drawable.setCornerRadius(float(dp(20)))
+                preview_drawable.setColor(jint(bubble_fill))
+                preview_drawable.setStroke(dp(2), jint(store.frame_color))
+                preview.setBackground(preview_drawable)
+
+                preview_text = TextView(context)
+                preview_text.setText(
+                    "\u041f\u0440\u0438\u0432\u0435\u0442, "
+                    "\u043a\u0430\u043a \u0434\u0435\u043b\u0430"
+                )
+                preview_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 17)
+                preview_text.setTextColor(jint(bubble_text))
+                preview_text.setSingleLine(True)
+                preview.addView(
+                    preview_text, LinearLayout.LayoutParams(-2, -2)
+                )
+
+                preview_time = TextView(context)
+                preview_time.setText("16:39 \u2713")
+                preview_time.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12)
+                preview_time.setTextColor(jint(bubble_text))
+                preview_time.setAlpha(0.75)
+                preview_time.setSingleLine(True)
+                time_params = LinearLayout.LayoutParams(-2, -2)
+                time_params.setMargins(dp(10), dp(4), 0, 0)
+                preview.addView(preview_time, time_params)
+
+                sheet_root.addView(
+                    preview,
+                    LayoutHelper.createLinear(
+                        -2, -2, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 22
+                    ),
+                )
+
+                swatches = []
+
+                def apply_selection(value):
+                    for swatch_color, drawable, check, _cell in swatches:
+                        try:
+                            style_swatch(
+                                drawable,
+                                swatch_color,
+                                selected=swatch_color == value,
+                                radius_dp=14,
+                            )
+                            check.setVisibility(
+                                View.VISIBLE
+                                if swatch_color == value
+                                else View.GONE
+                            )
+                        except Exception:
+                            pass
+
+                def refresh(value):
+                    value = _normalize_frame_color(value)
+                    try:
+                        preview_drawable.setStroke(dp(2), jint(value))
+                        apply_selection(value)
+                        preview.invalidate()
+                    except Exception:
+                        pass
+
+                def select(value):
+                    try:
+                        store.save_color(value)
+                        refresh(store.frame_color)
+                        update_row(store.frame_color)
+                        plugin.repaint.invalidate_visible_messages()
+                    except Exception:
+                        pass
+
+                # ---- сетка 5 x 3 ----
+                grid = LinearLayout(context)
+                grid.setOrientation(LinearLayout.VERTICAL)
+                grid.setGravity(Gravity.CENTER_HORIZONTAL)
+                for start in range(0, len(FRAME_COLORS), 5):
+                    palette_row = LinearLayout(context)
+                    palette_row.setOrientation(LinearLayout.HORIZONTAL)
+                    palette_row.setGravity(Gravity.CENTER_HORIZONTAL)
+                    for color in FRAME_COLORS[start : start + 5]:
+                        cell = FrameLayout(context)
+                        cell_params = LinearLayout.LayoutParams(
+                            dp(48), dp(48)
+                        )
+                        cell_params.setMargins(dp(5), dp(5), dp(5), dp(5))
+                        palette_row.addView(cell, cell_params)
+
+                        fill = View(context)
+                        fill_drawable = GradientDrawable()
+                        style_swatch(fill_drawable, color, radius_dp=14)
+                        fill.setBackground(fill_drawable)
+                        cell.addView(fill, FrameLayout.LayoutParams(-1, -1))
+
+                        check = TextView(context)
+                        check.setText("\u2713")
+                        check.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20)
+                        check.setTextColor(jint(_contrast_color(color)))
+                        check.setGravity(Gravity.CENTER)
+                        check.setTypeface(Typeface.DEFAULT_BOLD)
+                        check.setIncludeFontPadding(False)
+                        check.setVisibility(View.GONE)
+                        cell.addView(
+                            check, FrameLayout.LayoutParams(-1, -1)
+                        )
+
+                        listener = OnClickListener(
+                            lambda _v, c=color: select(c)
+                        )
+                        cell.setClickable(True)
+                        cell.setFocusable(True)
+                        cell.setOnClickListener(listener)
+                        cell.setContentDescription("Frame color")
+                        plugin._settings_refs.append(listener)
+                        swatches.append(
+                            (color, fill_drawable, check, cell)
+                        )
+                    grid.addView(
+                        palette_row,
+                        LayoutHelper.createLinear(-2, -2, Gravity.CENTER_HORIZONTAL),
+                    )
+                sheet_root.addView(
+                    grid,
+                    LayoutHelper.createLinear(-1, -2),
+                )
+                refresh(store.frame_color)
+
+                # ---- показываем как bottom sheet ----
+                try:
+                    SheetBuilder = jclass(
+                        "org.telegram.ui.ActionBar.BottomSheet$Builder"
+                    )
+                    sheet_builder = SheetBuilder(context)
+                    sheet_builder.setCustomView(sheet_root)
+                    state["dialog"] = sheet_builder.show()
+                    return
+                except Exception as sheet_error:
+                    report("palette: bottom sheet failed", sheet_error)
+                    # запасной вариант: обычный диалог
+                    try:
+                        parent = sheet_root.getParent()
+                        if parent is not None:
+                            parent.removeView(sheet_root)
+                    except Exception:
+                        pass
+
+                from ui.alert import AlertDialogBuilder
+
+                builder = AlertDialogBuilder(context)
+                builder.set_title("Frame color")
+                builder.set_view(sheet_root)
+                builder.set_positive_button(
+                    "Done", lambda b, _w: b.dismiss()
+                )
+                state["dialog"] = builder.get_dialog() or builder
+                builder.show()
+
+            state["open_dialog"] = open_dialog
+
+            state["refresh_row"] = update_row
+            update_row(store.frame_color)
+            return root
+
+        def bind_view(view, item, divider, adapter, list_view):
+            try:
+                refresh_row = state.get("refresh_row")
+                if refresh_row is not None:
+                    refresh_row(store.frame_color)
+            except Exception:
+                pass
+
+        def report(prefix, error=None, debug=False):
+            text = prefix if error is None else prefix + ": " + _error_text(error)
+            try:
+                plugin._log_safe(text)
+            except Exception:
+                pass
+            try:
+                from ui.bulletin import BulletinHelper
+
+                if debug:
+                    BulletinHelper.show_info(text)
+                else:
+                    BulletinHelper.show_error(text)
+            except Exception:
+                pass
+
+        def on_click(*args):
+            # сигнатура зависит от версии SDK, поэтому берём view с конца
+            view = args[-1] if args else None
+
+            def run():
+                try:
+                    open_fn = state.get("open_dialog")
+                    if open_fn is None:
+                        report("palette: open_dialog is None")
+                        return
+                    open_fn(view)
+                except Exception as error:
+                    report("palette: open failed", error)
+
+            run_on_ui_thread(run)
+
+        factory = SimpleSettingFactory(
+            create_view,
+            bind_view,
+            is_clickable=True,
+            is_shadow=False,
+            on_click=on_click,
+        )
+        plugin._settings_refs.append(factory)
+        return Custom(factory=factory.instance.java)
+
+
+class AlphaMsgPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.store = SettingsStore(self)
+        self.repaint = RepaintHelper()
+        self._unhooks = []
+        self._hook_objs = []
+        self._hook_target = None
+        self._frame_hooks = []
+        self._frame_unhooks = []
+        self._frame_installed = False
+        self._frame_percent = DEFAULT_ALPHA_FRAME
+        self._frame_color = DEFAULT_FRAME_COLOR
+        self._percent = DEFAULT_ALPHA_FILL
+        self._settings_refs = []
+        self._compat_notified = False
+        self._feature_ready = False
+        self._feature_status = ""
+        self._feature_reason = ""
+        self._last_logged_reason = None
+        self._load_called = False
+        self._initialized = False
+
+    def _log_safe(self, message):
+        try:
+            self.log("[AlphaMsg] " + str(message))
+        except Exception:
+            pass
+
+    def _log_once(self, reason):
+        if reason == self._last_logged_reason:
+            return
+        self._last_logged_reason = reason
+        self._log_safe(reason)
+
+    def _apply_percent(self, percent):
+        value = _clamp_percent(percent)
+        self._percent = value
+        for hook_obj in self._hook_objs:
+            try:
+                hook_obj.percent = value
+            except Exception:
+                pass
+        self._sync_fill_hook(value)
+
+    def _sync_fill_hook(self, value):
+        if not self._initialized or not self._feature_ready:
+            return
+        try:
+            if value >= MAX_ALPHA_FILL:
+                if self._unhooks and self._hook_target in ("setAlpha", "setAlpha-all"):
+                    self._suspend_fill_hook()
+            elif not self._unhooks:
+                self._install_hook()
+                self._apply_frame(self.store.frame_percent)
+        except InstallFailure as failure:
+            self._log_safe("fill hook install failed: " + failure.reason)
+        except Exception as error:
+            self._log_safe("fill hook sync failed: " + _error_text(error))
+
+    def _suspend_fill_hook(self):
+        failed = False
+        for unhook in list(self._unhooks):
+            try:
+                self.unhook_method(unhook)
+            except Exception as error:
+                failed = True
+                self._log_safe("fill unhook failed: " + _error_text(error))
+        if failed:
+            return
+        self._unhooks = []
+        self._hook_objs = []
+        self._hook_target = None
+
+    def _apply_frame(self, percent):
+        value = _clamp_percent(percent, DEFAULT_ALPHA_FRAME)
+        self._frame_percent = value
+        for hook_obj in self._hook_objs:
+            try:
+                hook_obj.frame_percent = value
+                hook_obj.frame_color = self._frame_color
+            except Exception:
+                pass
+        for hook_obj in self._frame_hooks:
+            try:
+                hook_obj.frame_percent = value
+                hook_obj.frame_color = self._frame_color
+            except Exception:
+                pass
+        if self._hook_target == "draw-all":
+            return
+        if self._hook_target == "draw":
+            for hook_obj in self._hook_objs:
+                try:
+                    hook_obj.frame_percent = 0
+                except Exception:
+                    pass
+        if not self._initialized or not self._feature_ready:
+            return
+        if value > 0:
+            if not self._frame_installed:
+                self._install_frame_hook()
+        else:
+            if self._frame_installed:
+                self._uninstall_frame_hook()
+
+    def _apply_frame_color(self, color):
+        value = _normalize_frame_color(color)
+        self._frame_color = value
+        for hook_obj in self._hook_objs:
+            try:
+                hook_obj.frame_color = value
+            except Exception:
+                pass
+        for hook_obj in self._frame_hooks:
+            try:
+                hook_obj.frame_color = value
+            except Exception:
+                pass
+        if (
+            self._initialized
+            and self._feature_ready
+            and self._frame_percent > 0
+            and not self._frame_installed
+            and self._hook_target != "draw-all"
+        ):
+            self._install_frame_hook()
+
+    def _show_notification(self, message):
+        def show():
+            try:
+                from ui.bulletin import BulletinHelper
+                BulletinHelper.show_error(message)
+                return
+            except Exception:
+                pass
+            try:
+                from android.widget import Toast
+                from org.telegram.messenger import ApplicationLoader
+                Toast.makeText(
+                    ApplicationLoader.applicationContext,
+                    message,
+                    Toast.LENGTH_LONG,
+                ).show()
+            except Exception:
+                pass
+
+        try:
+            run_on_ui_thread(show)
+        except Exception:
+            show()
+
+    def _show_feature_reason(self, _view=None):
+        reason = self._feature_reason or "unknown error"
+        self._show_notification("Alpha Msg: " + reason)
+
+    def _notify_failure_once(self, reason):
+        self._log_once(reason)
+        if self._compat_notified:
+            return
+        self._compat_notified = True
+        self._show_notification("Alpha Msg: " + reason)
+
+    def _fail(self, status, reason):
+        self._feature_ready = False
+        self._feature_status = status
+        self._feature_reason = reason
+        self._initialized = False
+        self._notify_failure_once(reason)
+
+    def _status_text(self):
+        status = self._feature_status or "hook failed"
+        return "Status: " + status
+
+    def _status_row(self):
+        return Text(self._status_text(), on_long_click=self._show_feature_reason)
+
+    def _mark_slider_failure(self, error):
+        self._feature_status = "slider failed"
+        self._feature_reason = "slider failed: " + _error_text(error)
+        try:
+            import traceback
+            detail = self._feature_reason + "\n" + traceback.format_exc()
+        except Exception:
+            detail = self._feature_reason
+        self._log_once(detail)
+
+    def _ensure_initialized(self):
+        if self._initialized:
+            return
+        try:
+            self.store.load()
+        except Exception as error:
+            self._fail("load failed", "load failed: " + _error_text(error))
+            return
+        if self._unhooks:
+            self._feature_ready = True
+            self._feature_status = ""
+            self._feature_reason = "OK " + (self._hook_target or "hook")
+            self._percent = self.store.percent
+            for hook_obj in self._hook_objs:
+                try:
+                    hook_obj.percent = self._percent
+                except Exception:
+                    pass
+            self._initialized = True
+            if self.store.frame_percent > 0:
+                self._apply_frame(self.store.frame_percent)
+            return
+        ok, status, detail = CompatProbe().check()
+        if not ok:
+            self._fail(status, detail)
+            return
+        if self.store.percent >= MAX_ALPHA_FILL:
+            # заливка 100% — хук на setAlpha не нужен, ставим при первом изменении
+            self._hook_target = None
+            self._feature_ready = True
+            self._feature_status = ""
+            self._feature_reason = "OK idle"
+        else:
+            try:
+                self._install_hook()
+            except InstallFailure as failure:
+                self._fail(failure.status, failure.reason)
+                return
+            except Exception as error:
+                self._fail("hook failed", "hook failed: " + _error_text(error))
+                return
+        self._initialized = True
+        if self.store.frame_percent > 0:
+            self._apply_frame(self.store.frame_percent)
+
+    def _normalized_unhooks(self, result):
+        if result is None:
+            return None
+        try:
+            handles = list(result)
+        except Exception:
+            return None
+        if not handles:
+            return None
+        return handles
+
+    def _arm_hooks(self, unhooks, hook_objs, target, reason):
+        self._unhooks = list(unhooks)
+        self._hook_objs = list(hook_objs)
+        self._hook_target = target
+        self._percent = self.store.percent
+        self._frame_percent = self.store.frame_percent
+        self._frame_color = self.store.frame_color
+        for hook_obj in self._hook_objs:
+            try:
+                hook_obj.percent = self._percent
+                hook_obj.frame_percent = self._frame_percent
+                hook_obj.frame_color = self._frame_color
+            except Exception:
+                pass
+        self._feature_ready = True
+        self._feature_status = ""
+        self._feature_reason = reason
+        self._log_safe("hook target: " + target)
+
+    def _install_hook(self):
+        drawable, drawable_name, drawable_via = _resolve_message_drawable_info()
+        if drawable is None:
+            raise InstallFailure(
+                "no MessageDrawable",
+                "no MessageDrawable: " + MESSAGE_DRAWABLE_CLASS + " not resolved",
+            )
+        if not drawable_name:
+            drawable_name = _class_name_of(drawable) or MESSAGE_DRAWABLE_CLASS
+        percent = self.store.percent
+        errors = []
+
+        method = _resolve_method(drawable, drawable_name, "setAlpha", 1)
+        if method is None:
+            errors.append("explicit setAlpha: no method")
+        else:
+            try:
+                method.setAccessible(True)
+            except Exception:
+                pass
+            try:
+                hook = BubbleAlphaHook(percent)
+                unhook = self.hook_method(method, hook)
+                if unhook is not None:
+                    self._arm_hooks([unhook], [hook], "setAlpha", "OK setAlpha")
+                    return
+                errors.append("explicit setAlpha: hook_method returned None")
+            except Exception as error:
+                errors.append("explicit setAlpha: " + _error_text(error))
+
+        all_hook = BubbleAlphaHook(percent)
+        try:
+            handles = self._normalized_unhooks(
+                self.hook_all_methods(drawable, "setAlpha", all_hook)
+            )
+        except Exception as error:
+            errors.append("setAlpha-all: " + _error_text(error))
+        else:
+            if handles:
+                self._arm_hooks(handles, [all_hook], "setAlpha-all", "OK setAlpha-all")
+                return
+            errors.append("setAlpha-all: None")
+
+        draw_method = _resolve_method(drawable, drawable_name, "draw", 1)
+        if draw_method is None:
+            errors.append("explicit draw: no method")
+        else:
+            try:
+                draw_method.setAccessible(True)
+            except Exception:
+                pass
+            try:
+                hook = BubbleDrawHook(percent)
+                unhook = self.hook_method(draw_method, hook)
+                if unhook is not None:
+                    self._arm_hooks([unhook], [hook], "draw", "OK draw")
+                    return
+                errors.append("explicit draw: hook_method returned None")
+            except Exception as error:
+                errors.append("explicit draw: " + _error_text(error))
+
+        draw_all_hook = BubbleDrawHook(percent)
+        try:
+            handles = self._normalized_unhooks(
+                self.hook_all_methods(drawable, "draw", draw_all_hook)
+            )
+        except Exception as error:
+            errors.append("draw-all: " + _error_text(error))
+        else:
+            if handles:
+                self._arm_hooks(
+                    handles, [draw_all_hook], "draw-all", "OK draw-all"
+                )
+                return
+            errors.append("draw-all: None")
+
+        context = drawable_name
+        if drawable_via:
+            context += " via " + drawable_via
+        raise InstallFailure(
+            "hook failed",
+            "hook failed: " + "; ".join(errors) + " [" + context + "]",
+        )
+
+    def _install_frame_hook(self):
+        if self._frame_installed:
+            return True
+        drawable, drawable_name, _drawable_via = _resolve_message_drawable_info()
+        if drawable is None:
+            self._log_safe("frame hook failed: no MessageDrawable")
+            return False
+        if not drawable_name:
+            drawable_name = _class_name_of(drawable) or MESSAGE_DRAWABLE_CLASS
+        candidates = (
+            ("draw", 2, True),
+            ("drawCached", 3, True),
+            ("drawCached", 2, True),
+            ("draw", 1, True),
+        )
+        for method_name, param_count, require_hardware in candidates:
+            method = _resolve_method(
+                drawable, drawable_name, method_name, param_count
+            )
+            if method is None:
+                continue
+            try:
+                method.setAccessible(True)
+            except Exception:
+                pass
+            try:
+                hook = FrameDrawHook(
+                    percent=DEFAULT_ALPHA_FILL,
+                    frame_percent=self._frame_percent,
+                    frame_color=self._frame_color,
+                    apply_fill=False,
+                    require_hardware=require_hardware,
+                )
+                handle = self.hook_method(method, hook)
+                if handle is not None:
+                    self._frame_hooks = [hook]
+                    self._frame_unhooks = [handle]
+                    self._frame_installed = True
+                    self._log_safe(
+                        "frame hook target: %s/%s"
+                        % (method_name, param_count)
+                    )
+                    return True
+            except Exception as error:
+                self._log_safe(
+                    "frame hook failed (%s/%s): %s"
+                    % (method_name, param_count, _error_text(error))
+                )
+        try:
+            hook = FrameDrawHook(
+                percent=DEFAULT_ALPHA_FILL,
+                frame_percent=self._frame_percent,
+                frame_color=self._frame_color,
+                apply_fill=False,
+                require_hardware=True,
+            )
+            handles = self._normalized_unhooks(
+                self.hook_all_methods(drawable, "draw", hook)
+            )
+            if handles:
+                self._frame_hooks = [hook]
+                self._frame_unhooks = list(handles)
+                self._frame_installed = True
+                self._log_safe("frame hook target: draw-all")
+                return True
+        except Exception as error:
+            self._log_safe("frame hook failed: " + _error_text(error))
+        self._log_safe("frame hook failed: draw not resolved")
+        return False
+
+    def _uninstall_frame_hook(self):
+        hooks = list(self._frame_hooks)
+        unhooks = list(self._frame_unhooks)
+        self._frame_hooks = []
+        self._frame_unhooks = []
+        for hook_obj in hooks:
+            try:
+                hook_obj.frame_percent = 0
+            except Exception:
+                pass
+        for unhook in unhooks:
+            try:
+                self.unhook_method(unhook)
+            except Exception as error:
+                self._log_safe("frame unhook failed: " + _error_text(error))
+        self._frame_installed = False
+
+    def _reset_state(self, clear_hook):
+        self._percent = DEFAULT_ALPHA_FILL
+        self._frame_percent = DEFAULT_ALPHA_FRAME
+        self._frame_color = DEFAULT_FRAME_COLOR
+        self._frame_hooks = []
+        self._frame_unhooks = []
+        self._frame_installed = False
+        self._initialized = False
+        self.store.reset()
+        self.repaint.clear()
+        self._settings_refs = []
+        self._feature_ready = False
+        self._feature_status = ""
+        self._feature_reason = ""
+        self._initialized = False
+        self._last_logged_reason = None
+        if clear_hook:
+            self._unhooks = []
+            self._hook_objs = []
+            self._hook_target = None
+
+    def on_plugin_load(self):
+        self._load_called = True
+        try:
+            self._ensure_initialized()
+        except Exception as error:
+            self._fail("load failed", "load failed: " + _error_text(error))
+
+    def on_plugin_unload(self):
+        hook_objs = list(self._hook_objs) + list(self._frame_hooks)
+        unhooks = list(self._unhooks)
+        for hook_obj in hook_objs:
+            try:
+                hook_obj.percent = DEFAULT_ALPHA_FILL
+                hook_obj.frame_percent = 0
+            except Exception:
+                pass
+        self._uninstall_frame_hook()
+        failed = False
+        for unhook in unhooks:
+            try:
+                self.unhook_method(unhook)
+            except Exception as error:
+                failed = True
+                self._log_safe("unhook failed: " + _error_text(error))
+        if failed:
+            self._reset_state(False)
+            self.repaint.invalidate_visible_messages()
+            return
+        self._reset_state(True)
+        self._compat_notified = False
+        self.repaint.invalidate_visible_messages()
+
+    def create_settings(self):
+        try:
+            self._ensure_initialized()
+        except Exception as error:
+            self._fail("load failed", "load failed: " + _error_text(error))
+        self._settings_refs = []
+        entries = [Header("AM ОЧКО")]
+        if self._feature_ready:
+            self._feature_status = ""
+            self._feature_reason = "OK " + (self._hook_target or "hook")
+            try:
+                entries.append(
+                    SliderFactory(self, self.store, "Alpha Fill", "fill").build()
+                )
+                entries.append(Divider())
+                entries.append(Header("MSG frame"))
+                entries.append(
+                    SliderFactory(self, self.store, "Alpha Frame", "frame").build()
+                )
+                entries.append(Divider())
+                entries.append(FrameColorFactory(self, self.store).build())
+            except Exception as error:
+                self._mark_slider_failure(error)
+                entries.append(self._status_row())
+        else:
+            entries.append(self._status_row())
+        return entries
